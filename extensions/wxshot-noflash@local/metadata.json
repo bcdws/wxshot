@@ -1,0 +1,7 @@
+{
+  "uuid": "wxshot-noflash@local",
+  "name": "wxshot no flash",
+  "description": "Disable GNOME's screenshot shutter flash for wxshot and other screenshot tools.",
+  "shell-version": ["50"],
+  "version": 1
+}
