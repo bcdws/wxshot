@@ -149,3 +149,9 @@ GNOME 50 的 screenshot portal 在调用 Shell 截图接口时把 `flash` 参数
 
 > 扩展需要**注销重登一次**才会被 GNOME Shell 加载（Wayland 不能热加载扩展）。
 > 生效后所有走 Shell/portal 的截图都不再闪；`wxshot --uninstall` 会移除它。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 bcdws
+
+随意使用、修改、分发，保留版权声明即可；不提供任何担保。

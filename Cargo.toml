@@ -2,6 +2,9 @@
 name = "wxshot"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/bcdws/wxshot"
+description = "微信风格的 Linux 截图工具（Rust + GTK4，面向 GNOME Wayland）"
 
 [dependencies]
 gtk4 = { version = "0.11.5", features = ["v4_10"] }
