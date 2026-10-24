@@ -1,0 +1,133 @@
+name: release
+
+# 打 v* tag 时自动构建并发布 Release 附件；也可手动触发。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布/刷新附件的已有 tag（如 v0.1.0）；留空只构建，不发布"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # 固定在 Ubuntu 24.04（glibc 2.39 + GTK 4.14）上构建，
+    # 比开发机 Ubuntu 26.04 编出来的二进制兼容面更宽。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      release: ${{ steps.meta.outputs.release }}
+    steps:
+      - name: Resolve tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [[ -z "$TAG" && "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG" == v* ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "build tag: '${TAG:-<none>}'"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install GTK4 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-4-dev libpango1.0-dev libcairo2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ runner.os }}
+
+      - name: Check version matches tag
+        if: steps.meta.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VER="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "v$VER" != "$TAG" ]]; then
+            echo "::error::Cargo.toml 版本是 v$VER，与 tag $TAG 不一致；请先升级版本号再打 tag"
+            exit 1
+          fi
+          echo "version ok: v$VER"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke test
+        run: ./target/release/wxshot --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/wxshot dist/wxshot-linux-x86_64
+          (cd dist && sha256sum wxshot-linux-x86_64 > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wxshot-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: needs.build.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wxshot-linux-x86_64
+          path: dist
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/wxshot-linux-x86_64
+          ./dist/wxshot-linux-x86_64 --version
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，覆盖附件"
+            gh release upload "$TAG" \
+              dist/wxshot-linux-x86_64 dist/SHA256SUMS \
+              -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" \
+              dist/wxshot-linux-x86_64 dist/SHA256SUMS \
+              -R "$GITHUB_REPOSITORY" \
+              --title "wxshot $TAG" --generate-notes
+          fi
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json tagName,assets \
+            --jq '{tag:.tagName, assets:[.assets[]|{name,size}]}'

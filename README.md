@@ -26,6 +26,23 @@ cargo build --release
 
 需要 GTK 4.10+（另存为对话框使用 `GtkFileDialog`）。
 
+## 发布（维护者）
+
+```bash
+# 先把 Cargo.toml 里的 version 改成新版本，提交后：
+git tag -a v0.1.1 -m "wxshot v0.1.1"
+git push origin v0.1.1
+```
+
+推送 `v*` tag 后，GitHub Actions（[.github/workflows/release.yml](.github/workflows/release.yml)）会自动：
+
+1. 在 **Ubuntu 24.04**（glibc 2.39 + GTK 4.14）上构建，兼容面比开发机更宽
+2. 校验 `Cargo.toml` 版本与 tag 一致，不一致直接失败
+3. 把 `wxshot-linux-x86_64` 和 `SHA256SUMS` 传到对应 Release（没有就新建）
+
+也可以在 Actions 页面手动触发 `release` 工作流并填写已有 tag，重新生成/覆盖附件；
+留空则只构建，产物在 workflow 的 Artifacts 里。
+
 ## 安装 / 卸载
 
 ```bash
