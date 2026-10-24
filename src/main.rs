@@ -63,8 +63,42 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        _ => run_gui(),
+        _ => {
+            // 被“启动应用程序”(XDG autostart) 拉起时绝不截图：
+            // 否则每次登录/重启都会立刻弹出一张全屏遮罩，还得手动 Esc。
+            if launched_from_autostart() {
+                eprintln!(
+                    "wxshot: 检测到由开机自启启动，已跳过截图。\n\
+                     wxshot 是一次性截图工具，按快捷键时由 GNOME 直接执行，\
+                     无需加入“启动应用程序”。\n\
+                     想让登录后立即可用 F1，保留全局快捷键即可；\
+                     如需彻底清理自启项，运行: wxshot --install"
+                );
+                return;
+            }
+            run_gui()
+        }
     }
+}
+
+/// 是否由 XDG autostart（GNOME“启动应用程序”）启动。
+///
+/// GIO 通过 .desktop 启动程序时会设置 `GIO_LAUNCHED_DESKTOP_FILE`，
+/// 自启项位于 `$XDG_CONFIG_HOME/autostart/`，据此精确区分“登录自启”
+/// 与“用户点击菜单 / 按全局快捷键”（后者是裸 spawn，不带该变量）。
+fn launched_from_autostart() -> bool {
+    if let Some(path) = std::env::var_os("GIO_LAUNCHED_DESKTOP_FILE") {
+        let in_autostart = PathBuf::from(path)
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .map(|name| name == "autostart")
+            .unwrap_or(false);
+        if in_autostart {
+            return true;
+        }
+    }
+    // 老版本 gnome-session 用这个变量标记自启进程
+    std::env::var_os("DESKTOP_AUTOSTART_ID").is_some()
 }
 
 fn help() {
@@ -274,6 +308,9 @@ fn install() -> Result<(), String> {
     hotkey::apply(&cfg.hotkey, &dest.to_string_lossy())?;
     grant_screenshot_permission();
     install_noflash_extension()?;
+    for removed in remove_autostart_entries() {
+        println!("已移除开机自启项: {removed}（wxshot 由快捷键拉起，无需自启）");
+    }
 
     println!("已安装: {}", dest.display());
     println!("无闪烁扩展已安装（注销重登后生效）");
@@ -282,9 +319,47 @@ fn install() -> Result<(), String> {
     Ok(())
 }
 
+fn autostart_dir() -> PathBuf {
+    glib::user_config_dir().join("autostart")
+}
+
+/// 删除指向 wxshot 的开机自启项。
+///
+/// 通过“启动应用程序”添加 wxshot 时，GNOME 通常会在
+/// `$XDG_CONFIG_HOME/autostart/` 放一个软链或副本；登录时它会执行裸的
+/// `wxshot`，从而立刻触发一次截图。wxshot 是单次截图工具，热键由
+/// gsd-media-keys 直接执行，完全不需要常驻，因此这里直接清掉。
+fn remove_autostart_entries() -> Vec<String> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(autostart_dir()) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let targets_wxshot = text.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("Exec=") && line.contains("wxshot")
+        });
+        // 只删本程序的自启项，不碰用户其他启动程序
+        if targets_wxshot && std::fs::remove_file(&path).is_ok() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                removed.push(name.to_string());
+            }
+        }
+    }
+    removed
+}
+
 fn uninstall() -> Result<(), String> {
     hotkey::remove_binding();
     remove_noflash_extension();
+    remove_autostart_entries();
     for path in [desktop_path(), icon_path(), install_path()] {
         if path.exists() {
             let _ = std::fs::remove_file(&path);

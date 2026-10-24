@@ -39,6 +39,12 @@ cargo build --release
 - 菜单项：`~/.local/share/applications/wxshot.desktop`
 - 配置：`~/.config/wxshot/config.ini`
 
+> **不要把它加进“启动应用程序”（开机自启）。**
+> wxshot 是单次截图工具，按 `F1` 时由 GNOME 的全局快捷键直接拉起，不需要常驻进程；
+> 自启只会在每次登录后立刻弹出一张全屏遮罩（还要手动 `Esc`）。
+> `--install` / `--uninstall` 会顺手清掉 `~/.config/autostart/` 里指向 wxshot 的自启项；
+> 即使自启项被重新加回来，程序检测到由 autostart 启动时也会直接跳过截图并退出。
+
 ```ini
 [general]
 hotkey=F1
