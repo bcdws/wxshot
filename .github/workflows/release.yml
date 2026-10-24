@@ -49,7 +49,7 @@ jobs:
           fi
           echo "build tag: '${TAG:-<none>}'"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -93,7 +93,7 @@ jobs:
           (cd dist && sha256sum wxshot-linux-x86_64 > SHA256SUMS)
           cat dist/SHA256SUMS
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: wxshot-linux-x86_64
           path: dist/*
@@ -105,7 +105,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: wxshot-linux-x86_64
           path: dist
