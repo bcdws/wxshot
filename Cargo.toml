@@ -1,6 +1,6 @@
 [package]
 name = "wxshot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/bcdws/wxshot"
@@ -8,7 +8,9 @@ description = "微信风格的 Linux 截图工具（Rust + GTK4，面向 GNOME W
 
 [dependencies]
 gtk4 = { version = "0.11.5", features = ["v4_10"] }
-ashpd = { version = "0.13.13", features = ["screenshot"] }
+ashpd = { version = "0.13.13", features = ["screenshot", "global_shortcuts"] }
+futures-util = "0.3"
+libc = "0.2"
 pangocairo = "0.22.9"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 cairo-rs = { version = "0.22.9", features = ["png"] }

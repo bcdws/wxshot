@@ -1095,11 +1095,13 @@ dependencies = [
 
 [[package]]
 name = "wxshot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ashpd",
  "cairo-rs",
+ "futures-util",
  "gtk4",
+ "libc",
  "pangocairo",
  "tokio",
 ]

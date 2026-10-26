@@ -10,7 +10,7 @@
 - 标注：矩形、椭圆、箭头、画笔、文字（支持 fcitx5 中文输入、可调颜色/字号）、马赛克、序号
 - 撤销（`Ctrl+Z`）、另存为（`Ctrl+S` / 软盘按钮）、复制到剪贴板（`Ctrl+C` / `Enter`）
 - 选区拖动 / 8 个手柄缩放
-- 快捷键可配置（默认 `F1`）
+- 快捷键可配置（默认 `F1`）；GNOME 用自定义快捷键，KDE Wayland 用 GlobalShortcuts portal
 - 截图走 xdg-desktop-portal 非交互接口，不弹 GNOME 自带的选择框
 - 剪贴板通过 `wl-copy` 写入，GNOME Wayland 下可靠
 
@@ -56,11 +56,17 @@ git push origin v0.1.1
 - 菜单项：`~/.local/share/applications/wxshot.desktop`
 - 配置：`~/.config/wxshot/config.ini`
 
-> **不要把它加进“启动应用程序”（开机自启）。**
-> wxshot 是单次截图工具，按 `F1` 时由 GNOME 的全局快捷键直接拉起，不需要常驻进程；
-> 自启只会在每次登录后立刻弹出一张全屏遮罩（还要手动 `Esc`）。
-> `--install` / `--uninstall` 会顺手清掉 `~/.config/autostart/` 里指向 wxshot 的自启项；
-> 即使自启项被重新加回来，程序检测到由 autostart 启动时也会直接跳过截图并退出。
+### 开机自启（KDE / GNOME 都安全）
+
+- **GNOME**：`F1` 由 GNOME 自定义快捷键直接拉起进程，不需要常驻，也不需要自启。
+- **KDE Wayland**：`gsettings` 不适用（GNOME 的媒体键 schema 在 KDE 不存在），`--install` 会写入
+  `~/.config/autostart/wxshot.desktop`，登录后启动 `wxshot --daemon`：
+  - 常驻但不截图，只通过标准 **GlobalShortcuts portal** 注册全局快捷键；
+  - 按 `F1` 时才截图，不会像以前那样登录就弹遮罩；
+  - 关掉常驻：`wxshot --uninstall`，或在“系统设置 → 开机与关机 → 自动启动”里删除 wxshot。
+
+> **不要**再往“启动应用程序”里加裸的 `wxshot`：那会执行一次截图并弹遮罩。
+> 程序检测到由 autostart 直接启动时会跳过截图并提示改用 `--daemon`。
 
 ```ini
 [general]
@@ -82,9 +88,15 @@ wxshot --set-hotkey Ctrl+Alt+A
 wxshot --set-hotkey Super+Shift+S
 ```
 
-支持 `Ctrl/Alt/Shift/Super` 组合，程序会转成 GNOME 的 accelerator 格式并写入自定义快捷键。
+支持 `Ctrl/Alt/Shift/Super` 组合。
+
+- GNOME：转成 GNOME accelerator 写入自定义快捷键。
+- KDE Wayland：先写入配置，再重启后台服务，让 portal 按新键重新绑定；
+  也可以在“系统设置 → 快捷键 → wxshot”里直接改。
 
 > 注意：全局热键会覆盖应用内的同名按键。把 `F1` 绑成截图后，浏览器/IDE 里的 F1 帮助会被截图取代。
+> KDE 下微信/企业微信原本也占用 `F1` 截图；wxshot 注册后会把 `F1` 接管（微信那一项变成 `none`），
+> 想保留微信的 `F1` 就给 wxshot 换一个键。
 
 ## 使用
 
@@ -109,7 +121,10 @@ wxshot --set-hotkey Super+Shift+S
 ## 架构
 
 ```
-快捷键 (GNOME custom keybinding)
+快捷键
+  ├─ GNOME: custom keybinding 直接执行 wxshot
+  └─ KDE:   wxshot --daemon（常驻）
+              └─ GlobalShortcuts portal → Activated → 截图
    │
    ▼
 capture.rs   xdg-desktop-portal Screenshot (interactive=false)

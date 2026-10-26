@@ -12,6 +12,8 @@ use gtk::glib;
 use gtk::glib::variant::ToVariant;
 use gtk::prelude::*;
 use std::cell::Cell;
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -41,6 +43,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "--daemon" => {
+            if let Err(e) = run_daemon() {
+                eprintln!("daemon 启动失败: {e}");
+                std::process::exit(1);
+            }
+        }
         "--set-hotkey" => {
             let Some(keys) = args.get(2) else {
                 eprintln!("用法: wxshot --set-hotkey F1");
@@ -66,13 +74,12 @@ fn main() {
         _ => {
             // 被“启动应用程序”(XDG autostart) 拉起时绝不截图：
             // 否则每次登录/重启都会立刻弹出一张全屏遮罩，还得手动 Esc。
+            // 需要开机常驻请用 `wxshot --daemon`（它不会截图，只注册快捷键）。
             if launched_from_autostart() {
                 eprintln!(
-                    "wxshot: 检测到由开机自启启动，已跳过截图。\n\
-                     wxshot 是一次性截图工具，按快捷键时由 GNOME 直接执行，\
-                     无需加入“启动应用程序”。\n\
-                     想让登录后立即可用 F1，保留全局快捷键即可；\
-                     如需彻底清理自启项，运行: wxshot --install"
+                    "wxshot: 检测到由开机自启直接启动，已跳过截图。\n\
+                     要开机常驻、按快捷键截图，请使用 `wxshot --daemon`；\n\
+                     要清理自启项，运行 `wxshot --install`。"
                 );
                 return;
             }
@@ -97,6 +104,14 @@ fn launched_from_autostart() -> bool {
             return true;
         }
     }
+    // KDE / GNOME 都可能把 XDG autostart 转换成 systemd 单元
+    // （systemd-xdg-autostart-generator 生成 app-<id>@autostart.service），
+    // 此时进程的 cgroup 里能看到该单元名。
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/self/cgroup") {
+        if cgroup.contains("@autostart.service") {
+            return true;
+        }
+    }
     // 老版本 gnome-session 用这个变量标记自启进程
     std::env::var_os("DESKTOP_AUTOSTART_ID").is_some()
 }
@@ -106,6 +121,7 @@ fn help() {
         "wxshot {} — 微信风格截图工具\n\n\
          用法:\n  \
          wxshot                  截图\n  \
+         wxshot --daemon         常驻后台（开机自启用，不截图）\n  \
          wxshot --set-hotkey F1  修改全局快捷键\n  \
          wxshot --install        安装到 ~/.local/bin 并绑定快捷键\n  \
          wxshot --uninstall      卸载\n  \
@@ -118,38 +134,340 @@ fn help() {
 fn run_gui() {
     let app = gtk::Application::builder().application_id(APP_ID).build();
     // 一次只允许存在一个截图会话。截图进行中或遮罩窗口已显示时，
-    // 再次按热键只把已有窗口拉回前台，绝不重新截图/新建窗口。
+    // 再次触发只把已有窗口拉回前台，绝不重新截图/新建窗口。
     let active = Rc::new(Cell::new(false));
-
     app.connect_activate({
         let active = active.clone();
+        move |app| start_capture(app, &active, false)
+    });
+    let _ = app.run();
+}
+
+/// 常驻后台：开机自启后不截图，只注册全局快捷键并等待。
+///
+/// KDE Wayland 下用标准的 GlobalShortcuts portal 注册快捷键（由桌面环境
+/// 分配/保存，不直接碰 KGlobalAccel，避免破坏合成器）；实际触发时回到
+/// GTK 主线程执行截图。`wxshot` 无参数启动会通过 GApplication 单实例
+/// 转发到这里，所以菜单、快捷键、重复启动行为一致。
+fn run_daemon() -> Result<(), String> {
+    let mut lock = match acquire_daemon_lock() {
+        Some(file) => file,
+        // 已有实例在跑，静默退出（比如重复自启）
+        None => return Ok(()),
+    };
+    let _ = writeln!(lock, "{}", std::process::id());
+
+    let app = gtk::Application::builder().application_id(APP_ID).build();
+    let active = Rc::new(Cell::new(false));
+    let first = Rc::new(Cell::new(true));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    {
+        let app = app.clone();
+        let active = active.clone();
+        let _ = glib::spawn_future_local(async move {
+            while rx.recv().await.is_some() {
+                start_capture(&app, &active, true);
+            }
+        });
+    }
+
+    if is_kde() {
+        register_global_shortcut(tx.clone(), config::Config::load().hotkey);
+    }
+
+    app.connect_activate({
+        let first = first.clone();
         move |app| {
-            if active.replace(true) {
-                if let Some(window) = app
-                    .active_window()
-                    .or_else(|| app.windows().first().cloned())
-                {
-                    window.present();
-                }
+            // 进程刚启动的那次 activate 不截图，否则开机自启又会弹遮罩
+            if first.replace(false) {
                 return;
             }
+            start_capture(app, &active, true);
+        }
+    });
 
-            let image = match capture::grab_screen() {
-                Ok(img) => img,
+    // 没有窗口时也保持运行
+    let _hold = app.hold();
+    // 用固定 argv 跑 GApplication，避免它把 --daemon 当成未知选项
+    let _ = app.run_with_args(&["wxshot"]);
+    drop(lock);
+    Ok(())
+}
+
+fn start_capture(app: &gtk::Application, active: &Rc<Cell<bool>>, keep_alive: bool) {
+    if active.replace(true) {
+        if let Some(window) = app
+            .active_window()
+            .or_else(|| app.windows().first().cloned())
+        {
+            window.present();
+        }
+        return;
+    }
+
+    let image = match capture::grab_screen() {
+        Ok(img) => img,
+        Err(e) => {
+            eprintln!("截图失败: {e}");
+            active.set(false);
+            if !keep_alive {
+                app.quit();
+            }
+            return;
+        }
+    };
+    let cfg = config::Config::load();
+    let window = ui::run(app, image, cfg);
+    let active = active.clone();
+    window.connect_destroy(move |_| active.set(false));
+}
+
+fn daemon_lock_path() -> PathBuf {
+    glib::user_runtime_dir().join("wxshot-daemon.lock")
+}
+
+/// 用 flock 保证只有一个常驻实例；进程退出锁自动释放。
+fn acquire_daemon_lock() -> Option<std::fs::File> {
+    let path = daemon_lock_path();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    (rc == 0).then_some(file)
+}
+
+fn stop_daemon() {
+    let path = daemon_lock_path();
+    let Ok(pid) = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .trim()
+        .parse::<i32>()
+    else {
+        return;
+    };
+    // 避免 PID 复用误杀
+    let cmdline = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    if !cmdline.contains("wxshot") || !cmdline.contains("--daemon") {
+        return;
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 是否已有常驻实例在跑（尝试取锁后立刻释放）。
+fn daemon_running() -> bool {
+    match acquire_daemon_lock() {
+        Some(lock) => {
+            drop(lock);
+            false
+        }
+        None => true,
+    }
+}
+
+/// 拉起常驻实例。
+///
+/// 必须通过 systemd 启动，并且单元名以 `app-<appid>@...` 形式存在：
+/// xdg-desktop-portal 的 host app 是从 cgroup 里的单元名推导 app id 的，
+/// 直接 fork 出来的进程没有 app id，GlobalShortcuts 会报 "An app id is required"。
+fn spawn_daemon(exe: &std::path::Path) {
+    use std::process::Stdio;
+    if daemon_running() {
+        return;
+    }
+    let dir = glib::user_cache_dir().join("wxshot");
+    let _ = std::fs::create_dir_all(&dir);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+        .ok();
+
+    let unit = "app-wxshot@local.service";
+    let mut cmd = std::process::Command::new("systemd-run");
+    cmd.args([
+        "--user",
+        "--collect",
+        "--quiet",
+        &format!("--unit={unit}"),
+        "--description=wxshot 后台",
+    ]);
+    cmd.arg(exe).arg("--daemon");
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    cmd.stderr(match log.as_ref() {
+        Some(file) => Stdio::from(file.try_clone().unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap())),
+        None => Stdio::null(),
+    });
+    if cmd.status().map(|s| s.success()).unwrap_or(false) {
+        return;
+    }
+
+    // 没有 systemd 时退回直接启动（此时 portal 快捷键可能不可用）
+    let mut direct = std::process::Command::new(exe);
+    direct.arg("--daemon").stdin(Stdio::null()).stdout(Stdio::null());
+    direct.stderr(match log {
+        Some(file) => Stdio::from(file),
+        None => Stdio::null(),
+    });
+    let _ = direct.spawn();
+}
+
+fn is_kde() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.to_ascii_uppercase().contains("KDE"))
+        .unwrap_or(false)
+        || std::env::var_os("KDE_FULL_SESSION").is_some()
+}
+
+/// 把 "Ctrl+Alt+A" 转成 portal 的 trigger 写法 "CTRL+ALT+A"。
+fn portal_trigger(hotkey: &str) -> String {
+    let mut parts: Vec<&str> = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let Some(key) = parts.pop() else {
+        return "F1".to_string();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        let m = match part.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "CTRL",
+            "alt" | "option" | "opt" => "ALT",
+            "shift" => "SHIFT",
+            "super" | "win" | "meta" | "cmd" => "LOGO",
+            _ => continue,
+        };
+        out.push(m.to_string());
+    }
+    let key = match key.to_ascii_lowercase().as_str() {
+        "space" => "space".to_string(),
+        "esc" | "escape" => "Escape".to_string(),
+        "enter" | "return" => "Return".to_string(),
+        other if other.starts_with('f') && other[1..].parse::<u8>().is_ok() => {
+            other.to_ascii_uppercase()
+        }
+        other => other.to_string(),
+    };
+    out.push(key);
+    out.join("+")
+}
+
+fn register_global_shortcut(tx: tokio::sync::mpsc::UnboundedSender<()>, hotkey: String) {
+    let trigger = portal_trigger(&hotkey);
+    let spawned = std::thread::Builder::new()
+        .name("wxshot-portal".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
                 Err(e) => {
-                    eprintln!("截图失败: {e}");
-                    active.set(false);
-                    app.quit();
+                    eprintln!("wxshot: 初始化快捷键运行时失败: {e}");
                     return;
                 }
             };
-            let cfg = config::Config::load();
-            let window = ui::run(app, image, cfg);
-            let active = active.clone();
-            window.connect_destroy(move |_| active.set(false));
+            rt.block_on(portal_loop(&trigger, tx));
+        });
+    if let Err(e) = spawned {
+        eprintln!("wxshot: 启动快捷键线程失败: {e}");
+    }
+}
+
+async fn portal_loop(trigger: &str, tx: tokio::sync::mpsc::UnboundedSender<()>) {
+    // portal 可能在登录早期还没准备好，或者在合成器重启后断开：
+    // 失败就退避重试，保证登录后过一会儿快捷键仍然可用。
+    let mut delay_secs = 1u64;
+    loop {
+        match portal_once(trigger, tx.clone()).await {
+            Ok(()) => {
+                delay_secs = 1;
+                eprintln!("wxshot: 快捷键会话结束，准备重新注册");
+            }
+            Err(e) => {
+                eprintln!(
+                    "wxshot: 注册全局快捷键失败（{e}），{} 秒后重试",
+                    delay_secs
+                );
+            }
         }
-    });
-    let _ = app.run();
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        delay_secs = (delay_secs * 2).min(60);
+    }
+}
+
+async fn portal_once(
+    trigger: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Result<(), ashpd::Error> {
+    use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
+    use futures_util::StreamExt;
+
+    let proxy = GlobalShortcuts::new().await?;
+    let session = proxy.create_session(Default::default()).await?;
+    let shortcut =
+        NewShortcut::new("capture", "wxshot 截图").preferred_trigger(Some(trigger));
+    let request = proxy
+        .bind_shortcuts(&session, &[shortcut], None, Default::default())
+        .await?;
+    let bound = request.response()?;
+    for s in bound.shortcuts() {
+        let shown = s.trigger_description();
+        eprintln!(
+            "wxshot: 全局快捷键已注册: {} → {}",
+            s.description(),
+            if shown.is_empty() { "（未分配，请在系统设置里设置）" } else { shown }
+        );
+    }
+
+    let mut activated = proxy.receive_activated().await?;
+    while let Some(event) = activated.next().await {
+        if event.shortcut_id() == "capture" {
+            let _ = tx.send(());
+        }
+    }
+    Ok(())
+}
+
+fn daemon_autostart_path() -> PathBuf {
+    // 文件名必须和菜单项 wxshot.desktop 一致：
+    // systemd-xdg-autostart-generator 会生成 app-wxshot@autostart.service，
+    // xdg-desktop-portal 从单元名解析出 app id "wxshot"，再查 wxshot.desktop
+    // 确认身份；名字对不上就拿不到 app id，GlobalShortcuts 会被拒绝。
+    glib::user_config_dir().join("autostart/wxshot.desktop")
+}
+
+fn write_daemon_autostart(exe: &std::path::Path) -> Result<(), String> {
+    let path = daemon_autostart_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建自启目录失败: {e}"))?;
+    }
+    let entry = [
+        "[Desktop Entry]".to_string(),
+        "Type=Application".to_string(),
+        "Name=wxshot 后台".to_string(),
+        "Comment=常驻后台等待截图快捷键（不会自动截图）".to_string(),
+        format!("Exec=\"{}\" --daemon", exe.display()),
+        format!("Icon={}", icon_path().display()),
+        "Terminal=false".to_string(),
+        "NoDisplay=true".to_string(),
+        "X-GNOME-Autostart-enabled=true".to_string(),
+        String::new(),
+    ]
+    .join("\n");
+    std::fs::write(&path, entry).map_err(|e| format!("写入自启项失败: {e}"))
 }
 
 fn install_path() -> PathBuf {
@@ -171,6 +489,12 @@ const NOFLASH_JS: &str =
     include_str!("../extensions/wxshot-noflash@local/extension.js");
 
 fn install_noflash_extension() -> Result<(), String> {
+    let has_schema = gtk::gio::SettingsSchemaSource::default()
+        .and_then(|s| s.lookup("org.gnome.shell", true))
+        .is_some();
+    if !has_schema {
+        return Ok(());
+    }
     let dir = glib::user_data_dir()
         .join("gnome-shell/extensions")
         .join(NOFLASH_UUID);
@@ -197,6 +521,12 @@ fn install_noflash_extension() -> Result<(), String> {
 }
 
 fn remove_noflash_extension() {
+    let has_schema = gtk::gio::SettingsSchemaSource::default()
+        .and_then(|s| s.lookup("org.gnome.shell", true))
+        .is_some();
+    if !has_schema {
+        return;
+    }
     let dir = glib::user_data_dir()
         .join("gnome-shell/extensions")
         .join(NOFLASH_UUID);
@@ -232,12 +562,20 @@ fn set_hotkey(keys: &str) -> Result<(), String> {
     } else {
         std::env::current_exe().map_err(|e| format!("定位可执行文件失败: {e}"))?
     };
-    hotkey::apply(&cfg.hotkey, &cmd.to_string_lossy())?;
+    if hotkey::available() {
+        hotkey::apply(&cfg.hotkey, &cmd.to_string_lossy())?;
+    }
     println!(
         "快捷键已设为 {}（{}）",
         keys,
         hotkey::normalize(keys)?
     );
+    if is_kde() {
+        // 常驻进程启动时通过 portal 绑定快捷键，改键后需要重启它
+        stop_daemon();
+        spawn_daemon(&cmd);
+        println!("后台服务已按新快捷键重启");
+    }
     Ok(())
 }
 
@@ -305,16 +643,32 @@ fn install() -> Result<(), String> {
 
     let cfg = config::Config::load();
     cfg.save()?;
-    hotkey::apply(&cfg.hotkey, &dest.to_string_lossy())?;
-    grant_screenshot_permission();
-    install_noflash_extension()?;
+    if hotkey::available() {
+        hotkey::apply(&cfg.hotkey, &dest.to_string_lossy())?;
+        grant_screenshot_permission();
+        install_noflash_extension()?;
+    }
     for removed in remove_autostart_entries() {
-        println!("已移除开机自启项: {removed}（wxshot 由快捷键拉起，无需自启）");
+        println!("已移除会直接截图的旧自启项: {removed}");
+    }
+
+    if is_kde() {
+        for legacy in ["wxshot-daemon.desktop", "io.github.wxshot.WxShot.desktop"] {
+            let _ = std::fs::remove_file(glib::user_config_dir().join("autostart").join(legacy));
+        }
+        write_daemon_autostart(&dest)?;
+        // 拉起常驻实例；若已在运行，新实例会因 flock 自动退出
+        spawn_daemon(&dest);
+        println!("已设置开机自启：登录后常驻后台，不会自动截图");
     }
 
     println!("已安装: {}", dest.display());
-    println!("无闪烁扩展已安装（注销重登后生效）");
-    println!("快捷键: {} → {}", cfg.hotkey, hotkey::normalize(&cfg.hotkey)?);
+    if hotkey::available() {
+        println!("无闪烁扩展已安装（注销重登后生效）");
+        println!("快捷键: {} → {}", cfg.hotkey, hotkey::normalize(&cfg.hotkey)?);
+    } else {
+        println!("快捷键: {}（由桌面环境的全局快捷键服务管理）", cfg.hotkey);
+    }
     println!("保存目录: {}", cfg.save_dir.display());
     Ok(())
 }
@@ -344,7 +698,7 @@ fn remove_autostart_entries() -> Vec<String> {
         };
         let targets_wxshot = text.lines().any(|line| {
             let line = line.trim_start();
-            line.starts_with("Exec=") && line.contains("wxshot")
+            line.starts_with("Exec=") && line.contains("wxshot") && !line.contains("--daemon")
         });
         // 只删本程序的自启项，不碰用户其他启动程序
         if targets_wxshot && std::fs::remove_file(&path).is_ok() {
@@ -357,9 +711,11 @@ fn remove_autostart_entries() -> Vec<String> {
 }
 
 fn uninstall() -> Result<(), String> {
+    stop_daemon();
     hotkey::remove_binding();
     remove_noflash_extension();
     remove_autostart_entries();
+    let _ = std::fs::remove_file(daemon_autostart_path());
     for path in [desktop_path(), icon_path(), install_path()] {
         if path.exists() {
             let _ = std::fs::remove_file(&path);

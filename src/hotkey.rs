@@ -50,7 +50,24 @@ pub fn normalize(input: &str) -> Result<String, String> {
     Ok(format!("{mods}{key_norm}"))
 }
 
+/// 当前系统是否提供 GNOME 的媒体键 schema（KDE 等桌面没有）。
+pub fn available() -> bool {
+    let source = gio::SettingsSchemaSource::default();
+    let has = |id: &str| {
+        source
+            .as_ref()
+            .and_then(|s| s.lookup(id, true))
+            .is_some()
+    };
+    has(SCHEMA) && has(ITEM_SCHEMA)
+}
+
 pub fn apply(hotkey: &str, command: &str) -> Result<(), String> {
+    if !available() {
+        return Err(
+            "当前桌面没有 GNOME 快捷键设置（KDE 下由 GlobalShortcuts portal 注册）".to_string(),
+        );
+    }
     let binding = normalize(hotkey)?;
     let settings = gio::Settings::new(SCHEMA);
 
@@ -81,6 +98,9 @@ pub fn apply(hotkey: &str, command: &str) -> Result<(), String> {
 }
 
 pub fn remove_binding() {
+    if !available() {
+        return;
+    }
     let settings = gio::Settings::new(SCHEMA);
     let mut paths: Vec<glib::GString> = settings
         .strv("custom-keybindings")
